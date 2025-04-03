@@ -12,15 +12,20 @@ async function main () {
   const repo = github.context.repo.repo
   const skipInvalidTags = core.getBooleanInput('skipInvalidTags')
   const noVersionBumpBehavior = core.getInput('noVersionBumpBehavior')
+  const noNewCommitBehavior = core.getInput('noNewCommitBehavior')
   const prefix = core.getInput('prefix') || ''
   const additionalCommits = core.getInput('additionalCommits').split('\n').map(l => l.trim()).filter(l => l !== '')
   const fromTag = core.getInput('fromTag')
+  const maxTagsToFetch = _.toSafeInteger(core.getInput('maxTagsToFetch') || 10)
+  const fetchLimit = (maxTagsToFetch < 1 || maxTagsToFetch > 100) ? 10 : maxTagsToFetch
+  const fallbackTag = core.getInput('fallbackTag')
+  const tagFilter = core.getInput('tagFilter')
 
   const bumpTypes = {
     major: core.getInput('majorList').split(',').map(p => p.trim()).filter(p => p),
     minor: core.getInput('minorList').split(',').map(p => p.trim()).filter(p => p),
     patch: core.getInput('patchList').split(',').map(p => p.trim()).filter(p => p),
-    patchAll: (core.getInput('patchAll') === true || core.getInput('patchAll') === 'true'),
+    patchAll: (core.getInput('patchAll') === true || core.getInput('patchAll') === 'true')
   }
 
   function outputVersion (version) {
@@ -39,9 +44,20 @@ async function main () {
     // GET LATEST + PREVIOUS TAGS
 
     const tagsRaw = await gh.graphql(`
-      query lastTags ($owner: String!, $repo: String!) {
-        repository (owner: $owner, name: $repo) {
-          refs(first: 10, refPrefix: "refs/tags/", orderBy: { field: TAG_COMMIT_DATE, direction: DESC }) {
+      query lastTags (
+        $owner: String!
+        $repo: String!
+        $fetchLimit: Int
+        ) {
+        repository (
+          owner: $owner
+          name: $repo
+          ) {
+          refs(
+            first: $fetchLimit
+            refPrefix: "refs/tags/"
+            orderBy: { field: TAG_COMMIT_DATE, direction: DESC }
+            ) {
             nodes {
               name
               target {
@@ -51,21 +67,43 @@ async function main () {
           }
         }
       }
-    `, {
+    `,
+    {
       owner,
-      repo
+      repo,
+      fetchLimit
     })
 
     const tagsList = _.get(tagsRaw, 'repository.refs.nodes', [])
     if (tagsList.length < 1) {
-      return core.setFailed('Couldn\'t find the latest tag. Make sure you have at least one tag created first!')
+      if (fallbackTag && semver.valid(fallbackTag)) {
+        core.info(`Using fallback tag: ${fallbackTag}`)
+        latestTag = { name: fallbackTag }
+      } else {
+        return core.setFailed('Couldn\'t find the latest tag. Make sure you have at least one tag created or provide a fallbackTag!')
+      }
+    }
+
+    let tagFilterRgx = null
+    if (tagFilter) {
+      core.info(`Will filter tags based on pattern: ${tagFilter}`)
+      tagFilterRgx = new RegExp(tagFilter)
     }
 
     let idx = 0
     for (const tag of tagsList) {
-      if (prefix && tag.name.indexOf(prefix) === 0) {
-        tag.name = tag.name.replace(prefix, '')
+      if (prefix) {
+        if (tag.name.indexOf(prefix) === 0) {
+          tag.name = tag.name.replace(prefix, '')
+        } else {
+          continue
+        }
       }
+
+      if (tagFilterRgx && !tagFilterRgx.test(tag.name)) {
+        continue
+      }
+
       if (semver.valid(tag.name)) {
         latestTag = tag
         break
@@ -76,7 +114,16 @@ async function main () {
     }
 
     if (!latestTag) {
-      return core.setFailed(skipInvalidTags ? 'None of the 10 latest tags are valid semver!' : 'Latest tag is invalid (does not conform to semver)!')
+      if (fallbackTag && semver.valid(fallbackTag)) {
+        core.info(`Using fallback tag: ${fallbackTag}`)
+        latestTag = { name: fallbackTag }
+      } else {
+        if (prefix) {
+          return core.setFailed(`None of the ${fetchLimit} latest tags are valid semver or match the specified prefix!`)
+        } else {
+          return core.setFailed(skipInvalidTags ? `None of the ${fetchLimit} latest tags are valid semver!` : 'Latest tag is invalid (does not conform to semver)!')
+        }
+      }
     }
 
     core.info(`Comparing against latest tag: ${prefix}${latestTag.name}`)
@@ -145,11 +192,26 @@ async function main () {
   } while (hasMoreCommits)
 
   if (additionalCommits && additionalCommits.length > 0) {
-    commits.push(...additionalCommits)
+    commits.push(...additionalCommits.map(ac => ({ commit: { message: ac }, sha: 'unknown' })))
   }
 
   if (!commits || commits.length < 1) {
-    return core.setFailed('Couldn\'t find any commits between HEAD and latest tag.')
+    switch (noNewCommitBehavior) {
+      case 'current': {
+        core.info(`Couldn't find any commits between branch HEAD and latest tag. Exiting with current as next version...`)
+        outputVersion(semver.clean(latestTag.name))
+        return
+      }
+      case 'silent': {
+        return core.info(`Couldn't find any commits between branch HEAD and latest tag. Exiting silently...`)
+      }
+      case 'warn': {
+        return core.warning(`Couldn't find any commits between branch HEAD and latest tag.`)
+      }
+      default: {
+        return core.setFailed(`Couldn't find any commits between branch HEAD and latest tag.`)
+      }
+    }
   }
 
   // PARSE COMMITS
@@ -197,6 +259,11 @@ async function main () {
         outputVersion(semver.clean(latestTag.name))
         return
       }
+      case 'patch': {
+        core.info('No commit resulted in a version bump since last release! Defaulting to using PATCH...')
+        bump = 'patch'
+        break
+      }
       case 'silent': {
         return core.info('No commit resulted in a version bump since last release! Exiting silently...')
       }
@@ -209,6 +276,7 @@ async function main () {
     }
   }
   core.info(`\n>>> Will bump version ${prefix}${latestTag.name} using ${bump.toUpperCase()}\n`)
+  core.setOutput('bump', bump || 'none')
 
   // BUMP VERSION
 
